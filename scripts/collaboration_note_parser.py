@@ -101,12 +101,36 @@ class TextStrategy:
 
     def to_text(self, block_row: dict) -> str:
         """转换文本块为 Markdown"""
-        if block_row.get("quoted"):
+        block_type = block_row.get("type", "")
+        
+        if block_type == "code":
+            return self.handle_code(block_row)
+        elif block_type == "math":
+            return self.handle_math(block_row)
+        elif block_row.get("quoted"):
             return self.handle_quote(block_row['text'])
         elif block_row.get("heading"):
             return self.handle_header(block_row, block_row['text'])
         else:
             return self.handle_text(block_row['text'])
+
+    def handle_code(self, block_row: dict) -> str:
+        """处理代码块"""
+        code = block_row.get("code", "")
+        language = block_row.get("language", "")
+        if language and language.lower() != "plain text":
+            return f"```{language}\n{code}\n```\n"
+        else:
+            return f"```\n{code}\n```\n"
+
+    def handle_math(self, block_row: dict) -> str:
+        """处理数学公式块"""
+        math = block_row.get("math", "")
+        display_mode = block_row.get("displayMode", False)
+        if display_mode:
+            return f"$$\n{math}\n$$\n"
+        else:
+            return f"${math}$\n"
 
     def handle_text(self, text_arr: list) -> str:
         """处理文本数组"""
@@ -186,6 +210,8 @@ class EmbedStrategy:
             return self.handle_drawio(embed_data)
         elif embed_type == "mermaid":
             return self.handle_mermaid(embed_data)
+        elif embed_type == "math":
+            return self.handle_math(embed_data)
         elif embed_type == "webpage":
             return self.handle_webpage(embed_data)
         else:
@@ -221,6 +247,17 @@ class EmbedStrategy:
                 file_name = "Mermaid流程图"
                 return f'\n[{file_name}](wiz-collab-attachment://{src})\n\n'
             return ""
+
+    def handle_math(self, embed_data: dict) -> str:
+        """处理数学公式"""
+        math_text = embed_data.get("mathjaxText", "")
+        align = embed_data.get("align", "center")
+        if math_text:
+            if align == "center":
+                return f"\n$$\n{math_text}\n$$\n"
+            else:
+                return f"${math_text}$\n"
+        return ""
 
     def handle_webpage(self, embed_data: dict) -> str:
         """处理网页嵌入"""
@@ -275,7 +312,9 @@ class MarkdownConverter:
         "text": TextStrategy,
         "list": ListStrategy,
         "embed": EmbedStrategy,
-        "table": TableStrategy
+        "table": TableStrategy,
+        "code": TextStrategy,
+        "math": TextStrategy
     }
 
     @staticmethod

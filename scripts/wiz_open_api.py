@@ -119,6 +119,39 @@ class WizOpenApi:
 
         return data['result']
 
+    def search_notes(self, keyword: str, with_abstract: bool = True, with_favor: bool = False):
+        """
+        搜索笔记（官方搜索接口）
+        :param keyword: 搜索关键词
+        :param with_abstract: 是否返回摘要
+        :param with_favor: 是否包含收藏
+        :return: 搜索结果列表
+        """
+        url = f'{self.kb_server}/ks/note/search/{self.kb_guid}'
+        params = {
+            'ss': keyword,
+            'withAbstract': 'true' if with_abstract else 'false',
+            'withFavor': 'true' if with_favor else 'false',
+            'clientType': 'web',
+            'clientVersion': '4.0',
+            'lang': 'zh-cn'
+        }
+        headers = {
+            'X-Wiz-Token': self.token,
+            'X-Wiz-Referer': 'http://127.0.0.1'
+        }
+
+        response = requests.get(url, params=params, headers=headers)
+
+        if response.status_code != 200:
+            raise Exception(f'搜索笔记失败: HTTP状态码 {response.status_code}')
+
+        data = response.json()
+        if data.get('returnCode') != 200:
+            raise Exception(f'搜索笔记失败: {data}')
+
+        return data.get("result", [])
+
     def get_note_detail(self, doc_guid: str):
         """
         获取笔记详情（用于判断笔记类型和下载内容）
@@ -386,7 +419,8 @@ class WizOpenApi:
             'docGuid': doc_guid,
             'kbGuid': self.kb_guid,
             'title': title,
-            'html': html
+            'html': html,
+            'resources': []
         }
 
         response = requests.put(

@@ -93,38 +93,13 @@ class WizMCPServer:
             },
             {
                 "name": "wiz_search_notes",
-                "description": "通过扫描元数据搜索笔记",
+                "description": "调用官方搜索接口搜索笔记",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "query": {
                             "type": "string",
                             "description": "搜索关键词（必填）"
-                        },
-                        "start_version": {
-                            "type": "integer",
-                            "description": "起始版本号，默认0"
-                        },
-                        "page_size": {
-                            "type": "integer",
-                            "description": "每页大小，默认100，范围1-200",
-                            "default": 100
-                        },
-                        "max_pages": {
-                            "type": "integer",
-                            "description": "最大页数，默认10，范围1-200",
-                            "default": 10
-                        },
-                        "fields": {
-                            "type": "array",
-                            "items": {"type": "string", "enum": ["title", "category", "url", "type"]},
-                            "description": "搜索字段，默认['title', 'category']",
-                            "default": ["title", "category"]
-                        },
-                        "case_sensitive": {
-                            "type": "boolean",
-                            "description": "是否区分大小写，默认false",
-                            "default": False
                         }
                     },
                     "required": ["query"]
@@ -155,6 +130,26 @@ class WizMCPServer:
                             "type": "boolean",
                             "description": "是否下载图片/附件到本地，默认true",
                             "default": True
+                        },
+                        "include_extracted_text": {
+                            "type": "boolean",
+                            "description": "是否抽取附件文本（OCR/解析），默认false",
+                            "default": False
+                        },
+                        "max_extract_chars": {
+                            "type": "integer",
+                            "description": "抽取文本总长度上限，默认20000，0不限",
+                            "default": 20000
+                        },
+                        "max_extract_chars_per_item": {
+                            "type": "integer",
+                            "description": "单文件抽取上限，默认5000，0不限",
+                            "default": 5000
+                        },
+                        "ocr_lang": {
+                            "type": "string",
+                            "description": "OCR语言参数，默认chi_sim+eng",
+                            "default": "chi_sim+eng"
                         }
                     },
                     "required": ["doc_guid"]
@@ -319,69 +314,17 @@ class WizMCPServer:
         }
 
     def _tool_wiz_search_notes(self, args: dict) -> dict:
-        """wiz_search_notes 工具"""
+        """wiz_search_notes 工具 - 调用官方搜索接口"""
         query = args.get("query", "")
-        start_version = args.get("start_version", 0)
-        page_size = min(max(args.get("page_size", 100), 1), 200)
-        max_pages = min(max(args.get("max_pages", 10), 1), 200)
-        fields = args.get("fields", ["title", "category"])
-        case_sensitive = args.get("case_sensitive", False)
 
         if not query:
             raise ValueError("query 是必填参数")
 
-        all_matches = []
-        current_version = start_version
-        pages_scanned = 0
-
-        while pages_scanned < max_pages:
-            result = self.api.get_note_list(current_version, page_size)
-
-            # 处理 API 返回数组或字典的情况
-            if isinstance(result, list):
-                notes = result
-            else:
-                notes = result.get("notes", []) if isinstance(result, dict) else []
-
-            if not notes:
-                break
-
-            for note in notes:
-                matched = False
-                note_text = ""
-
-                if "title" in fields:
-                    note_text += str(note.get("title", "")) + " "
-                if "category" in fields:
-                    note_text += str(note.get("category", "")) + " "
-                if "url" in fields:
-                    note_text += str(note.get("url", "")) + " "
-                if "type" in fields:
-                    note_text += str(note.get("type", "")) + " "
-
-                if case_sensitive:
-                    matched = query in note_text
-                else:
-                    matched = query.lower() in note_text.lower()
-
-                if matched:
-                    all_matches.append(note)
-
-            # 处理 API 返回数组或字典的情况
-            if isinstance(result, list):
-                next_version = None
-            else:
-                next_version = result.get("next_version") if isinstance(result, dict) else None
-
-            if next_version is None or next_version == 0:
-                break
-
-            current_version = next_version
-            pages_scanned += 1
+        matches = self.api.search_notes(query, with_abstract=True, with_favor=False)
 
         return {
-            "matches": all_matches,
-            "next_version": current_version if all_matches else None
+            "matches": matches,
+            "next_version": None
         }
 
     def _tool_wiz_get_note(self, args: dict) -> dict:
@@ -390,9 +333,17 @@ class WizMCPServer:
         format_type = args.get("format", "markdown")
         include_info = args.get("include_info", True)
         include_resources = args.get("include_resources", True)
+        include_extracted_text = args.get("include_extracted_text", False)
+        max_extract_chars = args.get("max_extract_chars", 20000)
+        max_extract_chars_per_item = args.get("max_extract_chars_per_item", 5000)
+        ocr_lang = args.get("ocr_lang", "chi_sim+eng")
 
         if not doc_guid:
             raise ValueError("doc_guid 是必填参数")
+
+        # 如果开启文本抽取，强制下载资源
+        if include_extracted_text:
+            include_resources = True
 
         # 先获取笔记详情判断类型
         detail = self.api.get_note_detail(doc_guid)
@@ -457,6 +408,21 @@ class WizMCPServer:
                     resources_info["replace_map"]
                 )
 
+        # 文本抽取
+        if include_extracted_text and result.get("resources"):
+            extract_result = self._extract_artifacts_text(
+                result.get("resources", []),
+                max_extract_chars,
+                max_extract_chars_per_item,
+                ocr_lang
+            )
+            result["extracted"] = extract_result["extracted"]
+            result["bundle_text"] = self._build_bundle_text(
+                result.get("markdown", ""),
+                extract_result["extracted"],
+                max_extract_chars
+            )
+
         return result
 
     def _download_note_resources(self, doc_guid: str, title: str) -> dict:
@@ -464,15 +430,11 @@ class WizMCPServer:
         resources = self.api.get_note_resources(doc_guid)
 
         output_dir = Path(__file__).parent.parent / "output" / "notes" / doc_guid
-        images_dir = output_dir / "images"
-        attachments_dir = output_dir / "attachments"
-
-        images_dir.mkdir(parents=True, exist_ok=True)
-        attachments_dir.mkdir(parents=True, exist_ok=True)
-
         downloaded_resources = []
         replace_map = {}
 
+        # 先过滤资源，收集有效资源
+        valid_resources = []
         for res in resources:
             name = res.get("name", "")
             url = res.get("url", "")
@@ -480,6 +442,30 @@ class WizMCPServer:
 
             if not name or not url:
                 continue
+
+            # 过滤非必要资源：name 是纯 GUID 格式的不是有效文件
+            import re
+            if re.match(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', name, re.I):
+                continue
+
+            valid_resources.append(res)
+
+        # 如果没有有效资源，直接返回
+        if not valid_resources:
+            return {
+                "resources": [],
+                "replace_map": {}
+            }
+
+        # 创建目录
+        images_dir = output_dir / "images"
+        attachments_dir = output_dir / "attachments"
+        images_dir.mkdir(parents=True, exist_ok=True)
+        attachments_dir.mkdir(parents=True, exist_ok=True)
+
+        for res in valid_resources:
+            name = res.get("name", "")
+            url = res.get("url", "")
 
             try:
                 # 判断是图片还是附件
@@ -534,16 +520,8 @@ class WizMCPServer:
         except:
             blocks = []
 
-        output_dir = Path(__file__).parent.parent / "output" / "notes" / doc_guid
-        images_dir = output_dir / "images"
-        attachments_dir = output_dir / "attachments"
-
-        images_dir.mkdir(parents=True, exist_ok=True)
-        attachments_dir.mkdir(parents=True, exist_ok=True)
-
-        downloaded_resources = []
-        replace_map = {}
-
+        # 先收集有效资源
+        valid_resources = []
         for block in blocks:
             if block.get("type") != "embed":
                 continue
@@ -551,18 +529,42 @@ class WizMCPServer:
             embed_type = block.get("embedType", "")
             embed_data = block.get("embedData", {})
 
-            if embed_type == "image":
+            if embed_type in ("image", "office", "drawio"):
                 src = embed_data.get("src", "")
                 file_name = embed_data.get("fileName", src)
+                if src:
+                    valid_resources.append({
+                        "type": embed_type,
+                        "src": src,
+                        "file_name": file_name
+                    })
 
-                if not src:
-                    continue
+        # 如果没有有效资源，直接返回
+        if not valid_resources:
+            return {
+                "resources": [],
+                "replace_map": {}
+            }
 
-                try:
+        # 创建目录
+        output_dir = Path(__file__).parent.parent / "output" / "notes" / doc_guid
+        images_dir = output_dir / "images"
+        attachments_dir = output_dir / "attachments"
+        images_dir.mkdir(parents=True, exist_ok=True)
+        attachments_dir.mkdir(parents=True, exist_ok=True)
+
+        downloaded_resources = []
+        replace_map = {}
+
+        for res in valid_resources:
+            embed_type = res["type"]
+            src = res["src"]
+            file_name = res["file_name"]
+
+            try:
+                if embed_type == "image":
                     content = self.api.get_collaboration_image(doc_guid, src)
                     save_path = images_dir / file_name
-                    with open(save_path, "wb") as f:
-                        f.write(content)
 
                     rel_path = f"output/notes/{doc_guid}/images/{file_name}"
                     downloaded_resources.append({
@@ -575,21 +577,9 @@ class WizMCPServer:
                     replace_map[src] = rel_path
                     logger.info(f"下载协作图片: {file_name}")
 
-                except Exception as e:
-                    logger.warning(f"下载协作图片失败: {src}, error: {e}")
-
-            elif embed_type in ("office", "drawio"):
-                src = embed_data.get("src", "")
-                file_name = embed_data.get("fileName", src)
-
-                if not src:
-                    continue
-
-                try:
+                elif embed_type in ("office", "drawio"):
                     content = self.api.download_collaboration_resource(editor_token, doc_guid, src)
                     save_path = attachments_dir / file_name
-                    with open(save_path, "wb") as f:
-                        f.write(content)
 
                     rel_path = f"output/notes/{doc_guid}/attachments/{file_name}"
                     downloaded_resources.append({
@@ -602,8 +592,16 @@ class WizMCPServer:
                     replace_map[src] = rel_path
                     logger.info(f"下载协作附件: {file_name}")
 
-                except Exception as e:
-                    logger.warning(f"下载协作附件失败: {src}, error: {e}")
+                with open(save_path, "wb") as f:
+                    f.write(content)
+
+            except Exception as e:
+                logger.warning(f"下载协作资源失败: {src}, error: {e}")
+
+        return {
+            "resources": downloaded_resources,
+            "replace_map": replace_map
+        }
 
         return {
             "resources": downloaded_resources,
@@ -626,6 +624,162 @@ class WizMCPServer:
             markdown = markdown.replace(f"]({old_path})", f"]({new_path})")
 
         return markdown
+
+    def _clamp_int(self, value: int, max_val: int) -> int:
+        """限制整数在合理范围"""
+        if max_val <= 0:
+            return value
+        return min(value, max_val)
+
+    def _extract_image_ocr(self, file_path: str, ocr_lang: str) -> str:
+        """对图片做 OCR"""
+        try:
+            from PIL import Image
+            import pytesseract
+            img = Image.open(file_path)
+            text = pytesseract.image_to_string(img, lang=ocr_lang)
+            return text.strip()
+        except Exception as e:
+            return f"[OCR error: {e}]"
+
+    def _extract_pdf_text(self, file_path: str) -> str:
+        """抽取 PDF 文本"""
+        try:
+            from pypdf import PdfReader
+            reader = PdfReader(file_path)
+            texts = []
+            for page in reader.pages:
+                text = page.extract_text()
+                if text:
+                    texts.append(text)
+            return "\n".join(texts)
+        except Exception as e:
+            return f"[PDF error: {e}]"
+
+    def _extract_docx_text(self, file_path: str) -> str:
+        """抽取 DOCX 文本（不使用 python-docx）"""
+        try:
+            import zipfile
+            import xml.etree.ElementTree as ET
+            with zipfile.ZipFile(file_path, 'r') as z:
+                with z.open('word/document.xml') as f:
+                    tree = ET.parse(f)
+                    root = tree.getroot()
+                    ns = {'w': 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'}
+                    texts = []
+                    for t in root.iter('{http://schemas.openxmlformats.org/wordprocessingml/2006/main}t'):
+                        if t.text:
+                            texts.append(t.text)
+                    return ''.join(texts)
+        except Exception as e:
+            return f"[DOCX error: {e}]"
+
+    def _extract_text_file(self, file_path: str) -> str:
+        """读取文本文件"""
+        try:
+            with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                return f.read()
+        except Exception as e:
+            return f"[Text error: {e}]"
+
+    def _extract_artifacts_text(self, resources: list, max_total: int, max_per_item: int, ocr_lang: str) -> dict:
+        """抽取所有附件文本"""
+        extracted_items = []
+        total_chars = 0
+
+        for res in resources:
+            name = res.get("name", "")
+            file_path = res.get("path", "")
+            rel_path = res.get("relative_path", "")
+            res_type = res.get("type", "attachment")
+
+            method = ""
+            text = ""
+            error = None
+
+            try:
+                ext = name.lower().split('.')[-1] if '.' in name else ''
+
+                # 图片 OCR
+                if ext in ('png', 'jpg', 'jpeg', 'gif', 'bmp', 'webp', 'tif', 'tiff'):
+                    method = "ocr"
+                    text = self._extract_image_ocr(file_path, ocr_lang)
+
+                # PDF
+                elif ext == 'pdf':
+                    method = "pdf"
+                    text = self._extract_pdf_text(file_path)
+
+                # DOCX
+                elif ext in ('docx', 'doc'):
+                    method = "docx"
+                    text = self._extract_docx_text(file_path)
+
+                # 文本文件
+                elif ext in ('txt', 'md', 'log', 'json', 'yaml', 'yml', 'csv', 'xml', 'html', 'py', 'js', 'java', 'c', 'cpp', 'h', 'sh', 'bat', 'ps1'):
+                    method = "text"
+                    text = self._extract_text_file(file_path)
+
+                else:
+                    method = ""
+
+            except Exception as e:
+                error = str(e)
+
+            chars = len(text)
+            # 限制单文件长度
+            if max_per_item > 0 and chars > max_per_item:
+                text = text[:max_per_item]
+                chars = len(text)
+
+            extracted_items.append({
+                "name": name,
+                "relative_path": rel_path,
+                "type": res_type,
+                "method": method,
+                "extracted_chars": chars,
+                "extracted_text": text,
+                "error": error
+            })
+
+            total_chars += chars
+
+        # 限制总长度
+        if max_total > 0 and total_chars > max_total:
+            # 从后往前截断
+            remaining = max_total
+            for item in reversed(extracted_items):
+                if item["extracted_chars"] <= remaining:
+                    remaining -= item["extracted_chars"]
+                else:
+                    item["extracted_text"] = item["extracted_text"][:remaining]
+                    item["extracted_chars"] = remaining
+                    remaining = 0
+                    break
+            total_chars = sum(item["extracted_chars"] for item in extracted_items)
+
+        return {
+            "extracted": {
+                "total_chars": total_chars,
+                "items": extracted_items
+            }
+        }
+
+    def _build_bundle_text(self, markdown: str, extracted: dict, max_total: int) -> str:
+        """构建 bundle_text"""
+        parts = [markdown]
+
+        for item in extracted.get("items", []):
+            if item.get("extracted_text"):
+                parts.append(f"\n\n--- {item['name']} ({item['method']}) ---\n")
+                parts.append(item["extracted_text"])
+
+        result = "".join(parts)
+
+        if max_total > 0 and len(result) > max_total:
+            result = result[:max_total]
+
+        return result
 
     def _tool_wiz_list_attachments(self, args: dict) -> dict:
         """wiz_list_attachments 工具"""
@@ -760,32 +914,126 @@ class WizMCPServer:
         category = args.get("category", "/My Notes/")
         tags = args.get("tags", "")
 
+        final_url = url
+
         # 如果提供了 URL，则抓取网页内容
         if url:
-            import trafilatura
+            import requests
+            from bs4 import BeautifulSoup
+            import html2text
+            import re
+
             logger.info(f"正在抓取 URL: {url}")
-            downloaded = trafilatura.fetch_url(url)
-            if downloaded:
-                markdown_content = trafilatura.extract(downloaded, output_format="markdown")
-                if not title:
-                    # 尝试从网页中提取标题
-                    from bs4 import BeautifulSoup
-                    soup = BeautifulSoup(downloaded, 'html.parser')
-                    title = soup.title.string if soup.title else url
-                content = markdown_content or ""
+
+            headers = {
+                'user-agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+                'accept-language': 'zh-CN,zh;q=0.9,en;q=0.8'
+            }
+
+            try:
+                response = requests.get(url, headers=headers, timeout=30, allow_redirects=True)
+                response.raise_for_status()
+
+                # 校验 content-type
+                content_type = response.headers.get('content-type', '')
+                if 'text/html' not in content_type.lower():
+                    # 检查响应体是否以 < 开头
+                    if not response.text.strip().startswith('<'):
+                        raise Exception(f"非 HTML 响应: content-type={content_type}")
+
+                # 获取最终跳转 URL
+                final_url = response.url
+
+                html_content = response.text
+                soup = BeautifulSoup(html_content, 'html.parser')
+
+                # 提取标题
+                if soup.title:
+                    title = soup.title.string.strip() if soup.title.string else ""
+
+                # 主内容节点选择
+                main_content = None
+
+                # 优先 article, main 且文本长度 > 200
+                for tag in ['article', 'main']:
+                    elem = soup.find(tag)
+                    if elem and len(elem.get_text(strip=True)) > 200:
+                        main_content = elem
+                        break
+
+                # 根据 id/class 关键字选择
+                if not main_content:
+                    keywords = ['content', 'article', 'post', 'thread', 'main', 'body', 'entry', 'text']
+                    for keyword in keywords:
+                        elems = soup.find_all(id=re.compile(keyword, re.I))
+                        for elem in elems:
+                            text_len = len(elem.get_text(strip=True))
+                            if text_len > 200:
+                                main_content = elem
+                                break
+                        if main_content:
+                            break
+
+                        elems = soup.find_all(class_=re.compile(keyword, re.I))
+                        for elem in elems:
+                            text_len = len(elem.get_text(strip=True))
+                            if text_len > 200:
+                                main_content = elem
+                                break
+                        if main_content:
+                            break
+
+                # fallback 到 body
+                if not main_content:
+                    main_content = soup.body if soup.body else soup
+
+                # 使用 html2text 转 Markdown
+                h = html2text.HTML2Text()
+                h.ignore_images = False
+                h.ignore_links = False
+                h.body_width = 0
+
+                # 设置 baseurl 以处理相对链接
+                parsed_url = requests.compat.urlparse(final_url)
+                baseurl = f"{parsed_url.scheme}://{parsed_url.netloc}"
+                h.baseurl = baseurl
+
+                markdown_content = h.handle(str(main_content))
+
+                # 清理标题非法字符，确保 .md 结尾
+                if title:
+                    title = re.sub(r'[\\/:*?"<>|]', '', title)
+                    if not title.endswith('.md'):
+                        title = title + '.md'
+                else:
+                    title = "无标题.md"
+
+                # Markdown 顶部追加来源
+                if final_url:
+                    markdown_content = f"[来源]({final_url})\n\n{markdown_content}"
+
+                content = markdown_content
                 logger.info(f"成功抓取 URL，内容长度: {len(content)}")
-            else:
-                raise Exception(f"无法抓取 URL: {url}")
+
+            except Exception as e:
+                raise Exception(f"抓取 URL 失败: {e}")
 
         if not content:
             raise Exception("content 或 url 是必填参数")
 
-        if not title:
-            title = "无标题"
+        # 清理标题非法字符，确保 .md 结尾
+        if title:
+            import re
+            title = re.sub(r'[\\/:*?"<>|]', '', title)
+            if not title.endswith('.md'):
+                title = title + '.md'
+        else:
+            title = "无标题.md"
 
-        # 将 Markdown 转换为 HTML
-        import markdown
-        html_body = markdown.markdown(content, extensions=['extra', 'meta'])
+        # Markdown 存 <pre> 格式
+        escaped_content = content.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+        html_body = f"<pre>{escaped_content}</pre>"
 
         # 构建为知笔记的 HTML 格式
         html = f"""<!DOCTYPE html>
@@ -802,13 +1050,21 @@ class WizMCPServer:
         # 创建笔记
         result_data = self.api.create_note(title, html, category, tags)
 
+        # 拿到 docGuid 后再调用一次 save_note 确保落库一致
+        doc_guid = result_data.get("result", {}).get("docGuid", "")
+        if doc_guid:
+            try:
+                self.api.save_note(doc_guid, title, html, category)
+            except Exception as e:
+                logger.warning(f"save_note 确认失败: {e}")
+
         # 返回结果
         return {
             "title": title,
             "category": category,
             "tags": tags,
-            "url": url if url else None,
-            "doc_guid": result_data.get("result", {}).get("docGuid", ""),
+            "url": final_url if final_url != url else (url if url else None),
+            "doc_guid": doc_guid,
             "message": "笔记创建成功"
         }
 
